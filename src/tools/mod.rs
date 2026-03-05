@@ -1,10 +1,18 @@
-use dataxlr8_mcp_core::mcp::{empty_schema, error_result, get_str, json_result, make_schema};
+use dataxlr8_mcp_core::mcp::{empty_schema, error_result, get_i64, get_str, json_result, make_schema};
 use dataxlr8_mcp_core::Database;
 use rmcp::model::*;
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::ServerHandler;
 use serde::{Deserialize, Serialize};
-use tracing::{error, info};
+use tracing::{error, info, warn};
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const DEFAULT_LIMIT: i64 = 50;
+const MAX_LIMIT: i64 = 500;
+const DEFAULT_OFFSET: i64 = 0;
 
 // ============================================================================
 // Data types
@@ -55,6 +63,53 @@ pub struct InvoiceStats {
     pub sent_count: i64,
     pub overdue_count: i64,
     pub draft_count: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PaginatedInvoices {
+    pub invoices: Vec<Invoice>,
+    pub limit: i64,
+    pub offset: i64,
+    pub count: usize,
+}
+
+// ============================================================================
+// Validation helpers
+// ============================================================================
+
+/// Extract a string, trim it, and return None if empty after trimming.
+fn get_trimmed_str(args: &serde_json::Value, key: &str) -> Option<String> {
+    get_str(args, key).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Basic email validation: must contain exactly one '@' with non-empty local and domain parts,
+/// and the domain must contain at least one '.'.
+fn is_valid_email(email: &str) -> bool {
+    let parts: Vec<&str> = email.split('@').collect();
+    if parts.len() != 2 {
+        return false;
+    }
+    let local = parts[0];
+    let domain = parts[1];
+    !local.is_empty() && !domain.is_empty() && domain.contains('.')
+}
+
+/// Validate and clamp pagination parameters.
+fn parse_pagination(args: &serde_json::Value) -> (i64, i64) {
+    let limit = get_i64(args, "limit")
+        .unwrap_or(DEFAULT_LIMIT)
+        .max(1)
+        .min(MAX_LIMIT);
+    let offset = get_i64(args, "offset")
+        .unwrap_or(DEFAULT_OFFSET)
+        .max(0);
+    (limit, offset)
+}
+
+const VALID_STATUSES: &[&str] = &["draft", "sent", "paid", "overdue", "void"];
+
+fn is_valid_status(status: &str) -> bool {
+    VALID_STATUSES.contains(&status)
 }
 
 // ============================================================================
@@ -119,12 +174,15 @@ fn build_tools() -> Vec<Tool> {
             name: "list_invoices".into(),
             title: None,
             description: Some(
-                "List invoices with optional filters by status and client".into(),
+                "List invoices with optional filters by status and client. Supports pagination via limit/offset."
+                    .into(),
             ),
             input_schema: make_schema(
                 serde_json::json!({
                     "status": { "type": "string", "enum": ["draft", "sent", "paid", "overdue", "void"], "description": "Filter by status" },
-                    "client": { "type": "string", "description": "Filter by client name or email (partial match)" }
+                    "client": { "type": "string", "description": "Filter by client name or email (partial match)" },
+                    "limit": { "type": "integer", "description": "Max results to return (default: 50, max: 500)" },
+                    "offset": { "type": "integer", "description": "Number of results to skip (default: 0)" }
                 }),
                 vec![],
             ),
@@ -162,7 +220,7 @@ fn build_tools() -> Vec<Tool> {
             input_schema: make_schema(
                 serde_json::json!({
                     "invoice_id": { "type": "string", "description": "Invoice ID to record payment for" },
-                    "amount": { "type": "number", "description": "Payment amount" },
+                    "amount": { "type": "number", "description": "Payment amount (must be positive)" },
                     "method": { "type": "string", "description": "Payment method (e.g. bank_transfer, card, cash)" },
                     "reference": { "type": "string", "description": "Payment reference or transaction ID" }
                 }),
@@ -178,9 +236,16 @@ fn build_tools() -> Vec<Tool> {
             name: "overdue_invoices".into(),
             title: None,
             description: Some(
-                "Find all invoices that are past their due date with status 'sent'".into(),
+                "Find all invoices that are past their due date with status 'sent'. Supports pagination via limit/offset."
+                    .into(),
             ),
-            input_schema: empty_schema(),
+            input_schema: make_schema(
+                serde_json::json!({
+                    "limit": { "type": "integer", "description": "Max results to return (default: 50, max: 500)" },
+                    "offset": { "type": "integer", "description": "Number of results to skip (default: 0)" }
+                }),
+                vec![],
+            ),
             output_schema: None,
             annotations: None,
             execution: None,
@@ -237,23 +302,26 @@ impl InvoicingMcpServer {
     // ---- Tool handlers ----
 
     async fn handle_create_invoice(&self, args: &serde_json::Value) -> CallToolResult {
-        let client_name = match get_str(args, "client_name") {
+        let client_name = match get_trimmed_str(args, "client_name") {
             Some(n) => n,
-            None => return error_result("Missing required parameter: client_name"),
+            None => return error_result("Missing or empty required parameter: client_name"),
         };
-        let client_email = match get_str(args, "client_email") {
+        let client_email = match get_trimmed_str(args, "client_email") {
             Some(e) => e,
-            None => return error_result("Missing required parameter: client_email"),
+            None => return error_result("Missing or empty required parameter: client_email"),
         };
+        if !is_valid_email(&client_email) {
+            return error_result("Invalid client_email format. Must be a valid email address (e.g. user@example.com)");
+        }
         let line_items = match args.get("line_items") {
             Some(li) => li.clone(),
             None => return error_result("Missing required parameter: line_items"),
         };
-        let due_date_str = match get_str(args, "due_date") {
+        let due_date_str = match get_trimmed_str(args, "due_date") {
             Some(d) => d,
-            None => return error_result("Missing required parameter: due_date"),
+            None => return error_result("Missing or empty required parameter: due_date"),
         };
-        let notes = get_str(args, "notes").unwrap_or_default();
+        let notes = get_trimmed_str(args, "notes").unwrap_or_default();
 
         // Parse due_date
         let due_date = match chrono::NaiveDate::parse_from_str(&due_date_str, "%Y-%m-%d") {
@@ -261,26 +329,61 @@ impl InvoicingMcpServer {
             Err(_) => return error_result("Invalid due_date format. Use YYYY-MM-DD"),
         };
 
-        // Calculate subtotal from line items
-        let subtotal: f64 = match line_items.as_array() {
-            Some(items) => items.iter().fold(0.0, |acc, item| {
-                let qty = item
-                    .get("quantity")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0);
-                let price = item
-                    .get("unit_price")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0);
-                acc + qty * price
-            }),
+        // Validate and calculate subtotal from line items
+        let items = match line_items.as_array() {
+            Some(items) if !items.is_empty() => items,
+            Some(_) => return error_result("line_items must be a non-empty array"),
             None => return error_result("line_items must be an array"),
         };
+
+        let mut subtotal: f64 = 0.0;
+        for (i, item) in items.iter().enumerate() {
+            let desc = item
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim())
+                .unwrap_or("");
+            if desc.is_empty() {
+                return error_result(&format!(
+                    "line_items[{i}]: missing or empty 'description'"
+                ));
+            }
+            let qty = match item.get("quantity").and_then(|v| v.as_f64()) {
+                Some(q) if q > 0.0 => q,
+                Some(_) => {
+                    return error_result(&format!(
+                        "line_items[{i}]: 'quantity' must be a positive number"
+                    ))
+                }
+                None => {
+                    return error_result(&format!(
+                        "line_items[{i}]: missing or invalid 'quantity'"
+                    ))
+                }
+            };
+            let price = match item.get("unit_price").and_then(|v| v.as_f64()) {
+                Some(p) if p >= 0.0 => p,
+                Some(_) => {
+                    return error_result(&format!(
+                        "line_items[{i}]: 'unit_price' must be non-negative"
+                    ))
+                }
+                None => {
+                    return error_result(&format!(
+                        "line_items[{i}]: missing or invalid 'unit_price'"
+                    ))
+                }
+            };
+            subtotal += qty * price;
+        }
 
         let tax = args
             .get("tax")
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0);
+        if tax < 0.0 {
+            return error_result("Tax amount must be non-negative");
+        }
         let total = subtotal + tax;
         let id = uuid::Uuid::new_v4().to_string();
 
@@ -326,7 +429,10 @@ impl InvoicingMcpServer {
         .await
         {
             Ok(i) => i,
-            Err(e) => return error_result(&format!("Database error: {e}")),
+            Err(e) => {
+                error!(invoice_id = id, error = %e, "Failed to fetch invoice");
+                return error_result(&format!("Database error: {e}"));
+            }
         };
 
         match invoice {
@@ -352,8 +458,20 @@ impl InvoicingMcpServer {
     }
 
     async fn handle_list_invoices(&self, args: &serde_json::Value) -> CallToolResult {
-        let status = get_str(args, "status");
-        let client = get_str(args, "client");
+        let status = get_trimmed_str(args, "status");
+        let client = get_trimmed_str(args, "client");
+        let (limit, offset) = parse_pagination(args);
+
+        // Validate status if provided
+        if let Some(ref s) = status {
+            if !is_valid_status(s) {
+                return error_result(&format!(
+                    "Invalid status '{}'. Must be one of: {}",
+                    s,
+                    VALID_STATUSES.join(", ")
+                ));
+            }
+        }
 
         // Build query dynamically based on filters
         let mut query = String::from("SELECT * FROM invoicing.invoices WHERE 1=1");
@@ -369,8 +487,10 @@ impl InvoicingMcpServer {
             ));
             bind_idx += 1;
         }
-        let _ = bind_idx; // suppress unused warning
-        query.push_str(" ORDER BY created_at DESC");
+        query.push_str(&format!(" ORDER BY created_at DESC LIMIT ${bind_idx}"));
+        bind_idx += 1;
+        query.push_str(&format!(" OFFSET ${bind_idx}"));
+        let _ = bind_idx;
 
         let mut q = sqlx::query_as::<_, Invoice>(&query);
 
@@ -380,10 +500,23 @@ impl InvoicingMcpServer {
         if let Some(ref c) = client {
             q = q.bind(format!("%{c}%"));
         }
+        q = q.bind(limit);
+        q = q.bind(offset);
 
         match q.fetch_all(self.db.pool()).await {
-            Ok(invoices) => json_result(&invoices),
-            Err(e) => error_result(&format!("Database error: {e}")),
+            Ok(invoices) => {
+                let count = invoices.len();
+                json_result(&PaginatedInvoices {
+                    invoices,
+                    limit,
+                    offset,
+                    count,
+                })
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to list invoices");
+                error_result(&format!("Database error: {e}"))
+            }
         }
     }
 
@@ -397,7 +530,10 @@ impl InvoicingMcpServer {
         .await
         {
             Ok(i) => i,
-            Err(e) => return error_result(&format!("Database error: {e}")),
+            Err(e) => {
+                error!(invoice_id = id, error = %e, "Failed to fetch invoice for send");
+                return error_result(&format!("Database error: {e}"));
+            }
         };
 
         match existing {
@@ -420,23 +556,27 @@ impl InvoicingMcpServer {
                         info!(id = id, "Invoice marked as sent");
                         json_result(&invoice)
                     }
-                    Err(e) => error_result(&format!("Failed to send invoice: {e}")),
+                    Err(e) => {
+                        error!(invoice_id = id, error = %e, "Failed to update invoice to sent");
+                        error_result(&format!("Failed to send invoice: {e}"))
+                    }
                 }
             }
         }
     }
 
     async fn handle_record_payment(&self, args: &serde_json::Value) -> CallToolResult {
-        let invoice_id = match get_str(args, "invoice_id") {
+        let invoice_id = match get_trimmed_str(args, "invoice_id") {
             Some(id) => id,
-            None => return error_result("Missing required parameter: invoice_id"),
+            None => return error_result("Missing or empty required parameter: invoice_id"),
         };
         let amount = match args.get("amount").and_then(|v| v.as_f64()) {
-            Some(a) => a,
-            None => return error_result("Missing required parameter: amount"),
+            Some(a) if a > 0.0 => a,
+            Some(a) if a <= 0.0 => return error_result("Payment amount must be a positive number"),
+            _ => return error_result("Missing or invalid required parameter: amount (must be a positive number)"),
         };
-        let method = get_str(args, "method").unwrap_or_default();
-        let reference = get_str(args, "reference").unwrap_or_default();
+        let method = get_trimmed_str(args, "method").unwrap_or_default();
+        let reference = get_trimmed_str(args, "reference").unwrap_or_default();
 
         // Verify invoice exists and is in a payable state
         let invoice: Option<Invoice> = match sqlx::query_as(
@@ -447,7 +587,10 @@ impl InvoicingMcpServer {
         .await
         {
             Ok(i) => i,
-            Err(e) => return error_result(&format!("Database error: {e}")),
+            Err(e) => {
+                error!(invoice_id = %invoice_id, error = %e, "Failed to fetch invoice for payment");
+                return error_result(&format!("Database error: {e}"));
+            }
         };
 
         let invoice = match invoice {
@@ -460,6 +603,9 @@ impl InvoicingMcpServer {
         }
         if invoice.status == "paid" {
             return error_result("Invoice is already fully paid");
+        }
+        if invoice.status == "draft" {
+            return error_result("Cannot record payment on a draft invoice. Send it first.");
         }
 
         let payment_id = uuid::Uuid::new_v4().to_string();
@@ -479,7 +625,10 @@ impl InvoicingMcpServer {
         .await
         {
             Ok(p) => p,
-            Err(e) => return error_result(&format!("Failed to record payment: {e}")),
+            Err(e) => {
+                error!(invoice_id = %invoice_id, error = %e, "Failed to insert payment");
+                return error_result(&format!("Failed to record payment: {e}"));
+            }
         };
 
         // Check total payments vs invoice total
@@ -492,28 +641,30 @@ impl InvoicingMcpServer {
         {
             Ok((sum,)) => sum,
             Err(e) => {
-                error!(error = %e, "Failed to sum payments");
+                error!(invoice_id = %invoice_id, error = %e, "Failed to sum payments");
                 0.0
             }
         };
 
         // If fully paid, mark invoice as paid
         if total_paid >= invoice.total {
-            if let Err(e) = sqlx::query(
+            match sqlx::query(
                 "UPDATE invoicing.invoices SET status = 'paid', paid_at = now() WHERE id = $1",
             )
             .bind(&invoice_id)
             .execute(self.db.pool())
             .await
             {
-                error!(error = %e, "Failed to mark invoice as paid");
-            } else {
-                info!(id = invoice_id, "Invoice marked as paid");
+                Ok(_) => info!(id = %invoice_id, "Invoice marked as paid"),
+                Err(e) => {
+                    error!(invoice_id = %invoice_id, error = %e, "Failed to mark invoice as paid");
+                    warn!(invoice_id = %invoice_id, "Payment recorded but invoice status not updated to paid");
+                }
             }
         }
 
         info!(
-            invoice_id = invoice_id,
+            invoice_id = %invoice_id,
             amount = amount,
             total_paid = total_paid,
             "Payment recorded"
@@ -527,81 +678,142 @@ impl InvoicingMcpServer {
         }))
     }
 
-    async fn handle_overdue_invoices(&self) -> CallToolResult {
+    async fn handle_overdue_invoices(&self, args: &serde_json::Value) -> CallToolResult {
+        let (limit, offset) = parse_pagination(args);
+
         match sqlx::query_as::<_, Invoice>(
-            "SELECT * FROM invoicing.invoices WHERE status = 'sent' AND due_date < CURRENT_DATE ORDER BY due_date ASC",
+            "SELECT * FROM invoicing.invoices WHERE status = 'sent' AND due_date < CURRENT_DATE ORDER BY due_date ASC LIMIT $1 OFFSET $2",
         )
+        .bind(limit)
+        .bind(offset)
         .fetch_all(self.db.pool())
         .await
         {
             Ok(invoices) => {
                 info!(count = invoices.len(), "Found overdue invoices");
-                json_result(&invoices)
+                let count = invoices.len();
+                json_result(&PaginatedInvoices {
+                    invoices,
+                    limit,
+                    offset,
+                    count,
+                })
             }
-            Err(e) => error_result(&format!("Database error: {e}")),
+            Err(e) => {
+                error!(error = %e, "Failed to fetch overdue invoices");
+                error_result(&format!("Database error: {e}"))
+            }
         }
     }
 
     async fn handle_invoice_stats(&self) -> CallToolResult {
         // Total revenue (paid invoices)
-        let (total_revenue,): (f64,) = sqlx::query_as(
+        let total_revenue = match sqlx::query_as::<_, (f64,)>(
             "SELECT COALESCE(SUM(total), 0) FROM invoicing.invoices WHERE status = 'paid'",
         )
         .fetch_one(self.db.pool())
         .await
-        .unwrap_or((0.0,));
+        {
+            Ok((v,)) => v,
+            Err(e) => {
+                error!(error = %e, "Failed to query total revenue");
+                return error_result(&format!("Database error fetching total revenue: {e}"));
+            }
+        };
 
         // Outstanding (sent but not paid)
-        let (outstanding,): (f64,) = sqlx::query_as(
+        let outstanding = match sqlx::query_as::<_, (f64,)>(
             "SELECT COALESCE(SUM(total), 0) FROM invoicing.invoices WHERE status IN ('sent', 'overdue')",
         )
         .fetch_one(self.db.pool())
         .await
-        .unwrap_or((0.0,));
+        {
+            Ok((v,)) => v,
+            Err(e) => {
+                error!(error = %e, "Failed to query outstanding amount");
+                return error_result(&format!("Database error fetching outstanding amount: {e}"));
+            }
+        };
 
         // Paid this month
-        let (paid_this_month,): (f64,) = sqlx::query_as(
+        let paid_this_month = match sqlx::query_as::<_, (f64,)>(
             "SELECT COALESCE(SUM(total), 0) FROM invoicing.invoices WHERE status = 'paid' AND paid_at >= date_trunc('month', CURRENT_DATE)",
         )
         .fetch_one(self.db.pool())
         .await
-        .unwrap_or((0.0,));
+        {
+            Ok((v,)) => v,
+            Err(e) => {
+                error!(error = %e, "Failed to query paid this month");
+                return error_result(&format!("Database error fetching paid this month: {e}"));
+            }
+        };
 
         // Counts by status
-        let (invoice_count,): (i64,) = sqlx::query_as(
+        let invoice_count = match sqlx::query_as::<_, (i64,)>(
             "SELECT COUNT(*) FROM invoicing.invoices",
         )
         .fetch_one(self.db.pool())
         .await
-        .unwrap_or((0,));
+        {
+            Ok((v,)) => v,
+            Err(e) => {
+                error!(error = %e, "Failed to query invoice count");
+                return error_result(&format!("Database error fetching invoice count: {e}"));
+            }
+        };
 
-        let (paid_count,): (i64,) = sqlx::query_as(
+        let paid_count = match sqlx::query_as::<_, (i64,)>(
             "SELECT COUNT(*) FROM invoicing.invoices WHERE status = 'paid'",
         )
         .fetch_one(self.db.pool())
         .await
-        .unwrap_or((0,));
+        {
+            Ok((v,)) => v,
+            Err(e) => {
+                error!(error = %e, "Failed to query paid count");
+                return error_result(&format!("Database error fetching paid count: {e}"));
+            }
+        };
 
-        let (sent_count,): (i64,) = sqlx::query_as(
+        let sent_count = match sqlx::query_as::<_, (i64,)>(
             "SELECT COUNT(*) FROM invoicing.invoices WHERE status = 'sent'",
         )
         .fetch_one(self.db.pool())
         .await
-        .unwrap_or((0,));
+        {
+            Ok((v,)) => v,
+            Err(e) => {
+                error!(error = %e, "Failed to query sent count");
+                return error_result(&format!("Database error fetching sent count: {e}"));
+            }
+        };
 
-        let (overdue_count,): (i64,) = sqlx::query_as(
+        let overdue_count = match sqlx::query_as::<_, (i64,)>(
             "SELECT COUNT(*) FROM invoicing.invoices WHERE status = 'sent' AND due_date < CURRENT_DATE",
         )
         .fetch_one(self.db.pool())
         .await
-        .unwrap_or((0,));
+        {
+            Ok((v,)) => v,
+            Err(e) => {
+                error!(error = %e, "Failed to query overdue count");
+                return error_result(&format!("Database error fetching overdue count: {e}"));
+            }
+        };
 
-        let (draft_count,): (i64,) = sqlx::query_as(
+        let draft_count = match sqlx::query_as::<_, (i64,)>(
             "SELECT COUNT(*) FROM invoicing.invoices WHERE status = 'draft'",
         )
         .fetch_one(self.db.pool())
         .await
-        .unwrap_or((0,));
+        {
+            Ok((v,)) => v,
+            Err(e) => {
+                error!(error = %e, "Failed to query draft count");
+                return error_result(&format!("Database error fetching draft count: {e}"));
+            }
+        };
 
         let stats = InvoiceStats {
             total_revenue,
@@ -626,7 +838,10 @@ impl InvoicingMcpServer {
         .await
         {
             Ok(i) => i,
-            Err(e) => return error_result(&format!("Database error: {e}")),
+            Err(e) => {
+                error!(invoice_id = id, error = %e, "Failed to fetch invoice for void");
+                return error_result(&format!("Database error: {e}"));
+            }
         };
 
         match existing {
@@ -649,7 +864,10 @@ impl InvoicingMcpServer {
                         info!(id = id, "Invoice voided");
                         json_result(&invoice)
                     }
-                    Err(e) => error_result(&format!("Failed to void invoice: {e}")),
+                    Err(e) => {
+                        error!(invoice_id = id, error = %e, "Failed to void invoice");
+                        error_result(&format!("Failed to void invoice: {e}"))
+                    }
                 }
             }
         }
@@ -701,21 +919,21 @@ impl ServerHandler for InvoicingMcpServer {
 
             let result = match name_str {
                 "create_invoice" => self.handle_create_invoice(&args).await,
-                "get_invoice" => match get_str(&args, "id") {
+                "get_invoice" => match get_trimmed_str(&args, "id") {
                     Some(id) => self.handle_get_invoice(&id).await,
-                    None => error_result("Missing required parameter: id"),
+                    None => error_result("Missing or empty required parameter: id"),
                 },
                 "list_invoices" => self.handle_list_invoices(&args).await,
-                "send_invoice" => match get_str(&args, "id") {
+                "send_invoice" => match get_trimmed_str(&args, "id") {
                     Some(id) => self.handle_send_invoice(&id).await,
-                    None => error_result("Missing required parameter: id"),
+                    None => error_result("Missing or empty required parameter: id"),
                 },
                 "record_payment" => self.handle_record_payment(&args).await,
-                "overdue_invoices" => self.handle_overdue_invoices().await,
+                "overdue_invoices" => self.handle_overdue_invoices(&args).await,
                 "invoice_stats" => self.handle_invoice_stats().await,
-                "void_invoice" => match get_str(&args, "id") {
+                "void_invoice" => match get_trimmed_str(&args, "id") {
                     Some(id) => self.handle_void_invoice(&id).await,
-                    None => error_result("Missing required parameter: id"),
+                    None => error_result("Missing or empty required parameter: id"),
                 },
                 _ => error_result(&format!("Unknown tool: {}", request.name)),
             };
