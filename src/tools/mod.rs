@@ -13,6 +13,9 @@ use tracing::{error, info, warn};
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 500;
 const DEFAULT_OFFSET: i64 = 0;
+const MAX_STRING_LENGTH: usize = 500;
+const MAX_NOTES_LENGTH: usize = 2000;
+const MAX_LINE_ITEMS: usize = 100;
 
 // ============================================================================
 // Data types
@@ -110,6 +113,22 @@ const VALID_STATUSES: &[&str] = &["draft", "sent", "paid", "overdue", "void"];
 
 fn is_valid_status(status: &str) -> bool {
     VALID_STATUSES.contains(&status)
+}
+
+/// Validate that a string is a valid UUID.
+fn is_valid_uuid(s: &str) -> bool {
+    uuid::Uuid::parse_str(s).is_ok()
+}
+
+/// Return an error if a string exceeds the given max length.
+fn check_length(value: &str, field: &str, max: usize) -> Result<(), CallToolResult> {
+    if value.len() > max {
+        Err(error_result(&format!(
+            "{field} exceeds maximum length of {max} characters"
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -313,6 +332,12 @@ impl InvoicingMcpServer {
         if !is_valid_email(&client_email) {
             return error_result("Invalid client_email format. Must be a valid email address (e.g. user@example.com)");
         }
+        if let Err(e) = check_length(&client_name, "client_name", MAX_STRING_LENGTH) {
+            return e;
+        }
+        if let Err(e) = check_length(&client_email, "client_email", MAX_STRING_LENGTH) {
+            return e;
+        }
         let line_items = match args.get("line_items") {
             Some(li) => li.clone(),
             None => return error_result("Missing required parameter: line_items"),
@@ -322,6 +347,9 @@ impl InvoicingMcpServer {
             None => return error_result("Missing or empty required parameter: due_date"),
         };
         let notes = get_trimmed_str(args, "notes").unwrap_or_default();
+        if let Err(e) = check_length(&notes, "notes", MAX_NOTES_LENGTH) {
+            return e;
+        }
 
         // Parse due_date
         let due_date = match chrono::NaiveDate::parse_from_str(&due_date_str, "%Y-%m-%d") {
@@ -331,6 +359,11 @@ impl InvoicingMcpServer {
 
         // Validate and calculate subtotal from line items
         let items = match line_items.as_array() {
+            Some(items) if items.len() > MAX_LINE_ITEMS => {
+                return error_result(&format!(
+                    "line_items exceeds maximum of {MAX_LINE_ITEMS} items"
+                ))
+            }
             Some(items) if !items.is_empty() => items,
             Some(_) => return error_result("line_items must be a non-empty array"),
             None => return error_result("line_items must be an array"),
@@ -567,7 +600,8 @@ impl InvoicingMcpServer {
 
     async fn handle_record_payment(&self, args: &serde_json::Value) -> CallToolResult {
         let invoice_id = match get_trimmed_str(args, "invoice_id") {
-            Some(id) => id,
+            Some(id) if is_valid_uuid(&id) => id,
+            Some(_) => return error_result("Invalid invoice_id format: must be a valid UUID"),
             None => return error_result("Missing or empty required parameter: invoice_id"),
         };
         let amount = match args.get("amount").and_then(|v| v.as_f64()) {
@@ -577,6 +611,12 @@ impl InvoicingMcpServer {
         };
         let method = get_trimmed_str(args, "method").unwrap_or_default();
         let reference = get_trimmed_str(args, "reference").unwrap_or_default();
+        if let Err(e) = check_length(&method, "method", MAX_STRING_LENGTH) {
+            return e;
+        }
+        if let Err(e) = check_length(&reference, "reference", MAX_STRING_LENGTH) {
+            return e;
+        }
 
         // Verify invoice exists and is in a payable state
         let invoice: Option<Invoice> = match sqlx::query_as(
@@ -606,6 +646,29 @@ impl InvoicingMcpServer {
         }
         if invoice.status == "draft" {
             return error_result("Cannot record payment on a draft invoice. Send it first.");
+        }
+
+        // Check for overpayment
+        let already_paid: f64 = match sqlx::query_as::<_, (f64,)>(
+            "SELECT COALESCE(SUM(amount), 0) FROM invoicing.payments WHERE invoice_id = $1",
+        )
+        .bind(&invoice_id)
+        .fetch_one(self.db.pool())
+        .await
+        {
+            Ok((sum,)) => sum,
+            Err(e) => {
+                error!(invoice_id = %invoice_id, error = %e, "Failed to check existing payments");
+                return error_result(&format!("Database error: {e}"));
+            }
+        };
+
+        let remaining = invoice.total - already_paid;
+        if amount > remaining {
+            return error_result(&format!(
+                "Payment of {amount:.2} exceeds remaining balance of {remaining:.2} (invoice total: {:.2}, already paid: {already_paid:.2})",
+                invoice.total
+            ));
         }
 
         let payment_id = uuid::Uuid::new_v4().to_string();
@@ -920,19 +983,22 @@ impl ServerHandler for InvoicingMcpServer {
             let result = match name_str {
                 "create_invoice" => self.handle_create_invoice(&args).await,
                 "get_invoice" => match get_trimmed_str(&args, "id") {
-                    Some(id) => self.handle_get_invoice(&id).await,
+                    Some(id) if is_valid_uuid(&id) => self.handle_get_invoice(&id).await,
+                    Some(_) => error_result("Invalid id format: must be a valid UUID"),
                     None => error_result("Missing or empty required parameter: id"),
                 },
                 "list_invoices" => self.handle_list_invoices(&args).await,
                 "send_invoice" => match get_trimmed_str(&args, "id") {
-                    Some(id) => self.handle_send_invoice(&id).await,
+                    Some(id) if is_valid_uuid(&id) => self.handle_send_invoice(&id).await,
+                    Some(_) => error_result("Invalid id format: must be a valid UUID"),
                     None => error_result("Missing or empty required parameter: id"),
                 },
                 "record_payment" => self.handle_record_payment(&args).await,
                 "overdue_invoices" => self.handle_overdue_invoices(&args).await,
                 "invoice_stats" => self.handle_invoice_stats().await,
                 "void_invoice" => match get_trimmed_str(&args, "id") {
-                    Some(id) => self.handle_void_invoice(&id).await,
+                    Some(id) if is_valid_uuid(&id) => self.handle_void_invoice(&id).await,
+                    Some(_) => error_result("Invalid id format: must be a valid UUID"),
                     None => error_result("Missing or empty required parameter: id"),
                 },
                 _ => error_result(&format!("Unknown tool: {}", request.name)),
